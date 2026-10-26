@@ -1,0 +1,11 @@
+.git/
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+tests/
+docs/
+pattern.png
+屏幕截图 2026-10-10 091717.png
+README.md
+examples/

@@ -1,0 +1,23 @@
+[project]
+name = "bead-pattern"
+version = "0.1.0"
+description = "Convert images to bead-pattern PNGs using local color registries."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "numpy>=2.0,<3",
+  "pillow>=10.0,<12",
+  "python-multipart>=0.0.9,<1",
+  "uvicorn>=0.30,<1",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0,<9",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+

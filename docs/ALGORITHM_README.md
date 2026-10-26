@@ -1,0 +1,227 @@
+# Bead Pattern Generation Service Design Specification
+
+> This document is the project's design specification. Service behavior, API contracts, input validation limits, palette registry structure, and core algorithms are defined here. Implementation code and usage documentation should stay consistent with it.
+
+## Project goal
+
+A user uploads an image and selects a local color registry, series, and pattern size. The service converts the image into a bead grid: it computes each cell's average color, finds the closest color code in the selected series, and outputs a pattern image with a color-code legend. The project uses Python, FastAPI, and local JSON palette files, without a database. uv manages dependencies, and the service runs from source or Docker.
+
+## Input and output
+
+Input: an image, `registry_id`, `series_id`, `width`, `height`, and optional `preserve_aspect_ratio`. `width × height` gives the bead columns and rows; for example, `50 × 40` requires 2,000 beads. Each grid cell represents one bead.
+
+Output: one PNG pattern containing a color grid, row and column coordinates, and a color-code legend. The service returns PNG bytes directly and also provides a transport function for sending the PNG to a downstream HTTP service. The assignment supplies no real upstream or downstream addresses, so integration tests verify both transfers.
+
+## Service boundaries
+
+Define generation as `generate(validated_image, palette, width, height, crop) -> png_bytes`. The FastAPI entry point validates the request, decodes the image, selects the palette, and calculates dimensions before passing trusted data to this function. The generation function neither reads an upload directory nor stores files long term.
+
+FastAPI exposes the upstream endpoint `POST /api/generate`: it receives the image and parameters, validates them, calls `generate`, and returns the pattern as `image/png`. The transport module also provides `send_to_downstream(client, target, png_bytes, request_id)`, which sends the PNG downstream via HTTP POST. An integrating caller supplies the real downstream address; this service does not read it from the user's request. The assignment does not implement upstream or downstream services themselves.
+
+In integration tests, a mock upstream reads an image from the test directory and calls `POST /api/generate`. A mock downstream receives the PNG from `send_to_downstream` and inspects it. Mock code and test files are excluded from the production application and expose no additional HTTP routes.
+
+## Local color registries
+
+Each registry is a directory under `src/data/registries/` and is distributed with the project source. When generating a pattern, the user selects an existing local registry and then a series within it. Switching registries affects only the palette used by the current request; it does not modify global settings.
+
+```text
+src/data/registries/
+  artkal/
+    s-5mm.json
+  perler/
+    color-chart.json
+```
+
+Example series file:
+
+```json
+{
+  "series_id": "color-chart",
+  "name": "Perler Color Chart",
+  "colors": [
+    { "code": "P1", "name": "Evergreen", "hex": "#315545" },
+    { "code": "P2", "name": "Light Grey", "hex": "#B3BAB8" }
+  ]
+}
+```
+
+Two palettes are currently included: `artkal/s-5mm.json` has 225 colors from the [Artkal color chart](https://www.pixel-beads.com/zh/artkal-bead-color-chart), and `perler/color-chart.json` has 103 colors from the [Perler color chart](https://trypetrelic.com/zh/perler-bead-color-chart.html). The data was saved from pages accessed on 2026-10-10, retaining only the series ID and name and each color's `code`, `name`, and `hex`. The Perler page notes that `P1` and similar codes are that site's shorthand rather than official Perler product numbers; interpret pattern legend codes accordingly. HEX values are screen reference colors. Specialty finishes and physical beads may differ.
+
+The directory name is `registry_id`, and the filename is `series_id`. At startup, the program scans and validates every JSON file once: each series must contain at least one color, codes must be unique, and HEX values must be valid. It then builds a read-only palette index. The API accepts only IDs already in that index and never concatenates request parameters into file paths. Restart the service after changing palettes.
+
+### Future palette sources
+
+The current version distributes palettes with the source to support local operation and tests. Future versions should download or synchronize registries from the cloud using the same `registry_id`, `series_id`, `code`, `name`, and `hex` structure. Validate a complete downloaded palette before replacing the local read-only index; retain the previous valid palette if any validation fails. This change does not affect `/api/generate` parameters or the color-matching algorithm.
+
+## Project structure
+
+```text
+project/
+  pyproject.toml         # uv project and dependency declarations
+  uv.lock                # dependency lockfile generated by uv
+  Dockerfile             # production image
+  docker-compose.yml     # local Docker configuration
+  .dockerignore
+  .gitignore
+  src/
+    bead_pattern/
+      __init__.py
+      main.py             # FastAPI routes and request validation
+      config.py           # static service limits; no environment variables
+      registry.py         # startup palette validation and read-only index
+      image_processing.py # image preparation, grid division, average colors
+      color_matching.py  # nearest color-code calculation
+      rendering.py       # draw the PNG pattern and legend
+      generator.py       # coordinate palette use, matching, and rendering
+      transport.py       # send PNG downstream over HTTP
+      schemas.py         # request and response data structures
+    data/
+      registries/        # palettes distributed with the source
+        artkal/s-5mm.json
+        perler/color-chart.json
+  tests/
+    integration/
+      mock_file_store.py # simulated upstream upload and downstream receiver
+      test_generate.py   # calls the real FastAPI endpoint
+      fixtures/          # fixed test input images
+        624f790ab7fb4fdbb516375c8dbd648f.png
+      output/            # generated test output; not committed
+```
+
+### Paths and delivery boundaries
+
+Do not read file paths from environment variables. `registry.py` locates the sibling `src/data/registries/` directory using `Path(__file__).resolve().parents[1] / "data" / "registries"`, independent of the current working directory. When running from source, keep `bead_pattern/` and `data/` as siblings; startup fails if palettes are missing. Users can select only existing palettes through `registry_id` and `series_id` and cannot specify server file paths. `config.py` centralizes static request limits and does not read environment variables.
+
+The production delivery includes `src/bead_pattern/`, `src/data/registries/`, `pyproject.toml`, `uv.lock`, `Dockerfile`, `docker-compose.yml`, `.dockerignore`, and the README. `tests/integration/` verifies the delivery, but its mock upstream and downstream code is excluded from the Docker image. Add `tests/integration/output/` to `.gitignore`. The production service does not persist images or host result files. The integration layer supplies the downstream HTTP address and credentials; neither belongs in a palette or request parameter.
+
+Declare dependencies in `pyproject.toml`, generate and commit `uv.lock` with `uv lock`, and install locally with `uv sync --frozen`. The startup command imports `bead_pattern` from source with `--app-dir src`. uv must generate the lockfile; do not write it manually.
+
+## Run from source and submit an image
+
+For the initial version, run from the project root without building a package:
+
+```powershell
+uv sync --frozen
+uv run uvicorn --app-dir src bead_pattern.main:app --host 127.0.0.1 --port 8000
+```
+
+## Run with Docker
+
+```powershell
+docker compose up --build
+```
+
+The Dockerfile installs production dependencies from `uv.lock`, copies `src/`, and starts Uvicorn on `0.0.0.0:8000`. The image includes `src/data/registries/`; `.dockerignore` excludes tests, development virtual environments, original input images, and generated results. Rebuild the image to update palettes.
+
+After startup, visit `http://127.0.0.1:8000/docs`, choose a local image under `POST /api/generate`, and enter `registry_id`, `series_id`, `width`, and `height`. You can also use `curl.exe` in PowerShell. This example uses a local image and the `perler/color-chart` palette:
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/api/generate" -F "image=@C:\path\to\photo.png" -F "registry_id=perler" -F "series_id=color-chart" -F "width=50" -F "height=40" --output pattern.png
+```
+
+`image` is a file field in `multipart/form-data`: it contains the image bytes, not a path to an image on the server. On success, the service returns HTTP 200, `Content-Type: image/png`, and `Content-Disposition: attachment; filename="pattern.png"`. The response body contains the complete PNG bytes. In this example, `--output pattern.png` saves the response as a local image. Invalid input returns an appropriate HTTP error code and a JSON error, not a PNG.
+
+By default, provide both `width` and `height`; the image is center-cropped to the target ratio. To retain the whole image's aspect ratio, add `preserve_aspect_ratio=true` and provide only `width` or `height`. The service calculates the missing dimension from the image ratio without cropping. Supplying both dimensions in this mode returns 422.
+
+```powershell
+# Preserve the original aspect ratio; calculate the row count from 100 bead columns.
+curl.exe -X POST "http://127.0.0.1:8000/api/generate" -F "image=@C:\path\to\photo.png" -F "registry_id=artkal" -F "series_id=s-5mm" -F "width=100" -F "preserve_aspect_ratio=true" --output pattern.png
+```
+
+### Upstream and downstream transfer contract
+
+- **Upstream calls this service:** `POST /api/generate` sends image bytes and parameters as `multipart/form-data`; this service returns PNG bytes in the HTTP response body.
+- **This service sends downstream:** `send_to_downstream` in `transport.py` uses an injected HTTP client to POST to a configured downstream target. The body is the same PNG bytes, `Content-Type` is `image/png`, and `request_id` is forwarded for tracing. The function only transfers bytes; it must not redraw or change the image.
+- The integration layer supplies the downstream address, authentication, and client. Since the assignment provides no real downstream service, `/api/generate` returns the image without sending it to an unknown address. If the downstream returns an unsuccessful status or the connection fails, the transport function reports failure; it does not treat the send as successful pattern generation.
+
+Processing flow:
+
+```text
+Image bytes and pattern parameters
+  → FastAPI validates and decodes the image, dimensions, and palette IDs
+  → Retrieve the palette from the validated read-only index
+  → Normalize the image and divide it into a width × height grid
+  → Compute each cell's average color
+  → Match nearest color codes to obtain a code matrix
+  → Count used codes and beads for the legend
+  → Draw the PNG with grid and color-code legend
+  → FastAPI returns PNG bytes
+```
+
+### Upload and download mocks in integration tests
+
+1. `tests/integration/test_generate.py` uses in-memory test images and `fixtures/624f790ab7fb4fdbb516375c8dbd648f.png` to simulate image bytes supplied by an upstream service.
+2. Tests send the image as `multipart/form-data` to the real `/api/generate` endpoint through FastAPI `TestClient`.
+3. Tests pass the response PNG to `send_to_downstream`. A mock HTTP downstream receives and saves it in `tests/integration/output/`. Tests check byte equality before and after transfer, image dimensions, the grid, and the color-code legend.
+
+Here, "upload" means the simulated upstream calls the real endpoint, and "download" means the upstream receives the PNG response. A separate mock downstream verifies the function that actively sends PNG bytes. The production service does not save uploaded images or generated files.
+
+### Data validation boundaries
+
+Business-data validation occurs only at two entry points:
+
+1. **Application startup:** validate every registry JSON under `src/data/registries/` and build a read-only palette index. Startup fails if any file is invalid. Request processing does not repeatedly validate codes or HEX values.
+2. **HTTP request entry:** verify that `registry_id` and `series_id` exist. In default mode, `width` and `height` must be positive integers and the grid area must stay within limits. With `preserve_aspect_ratio=true`, accept only one dimension and calculate the other from the image ratio. The entry point also checks upload byte size, image decodability, decoded pixel count, and estimated output PNG canvas dimensions; it applies EXIF orientation and converts the image to sRGB. Invalid ICC profiles are handled here too. The entry point converts errors to HTTP responses consistently.
+
+After these checks, generation modules receive a decoded image, a validated palette, and valid dimensions. `image_processing.py`, `color_matching.py`, and `rendering.py` do not repeat validity checks or handle HTTP errors. Outbound `transport.py` checks only whether downstream HTTP transfer succeeded; it does not revalidate the PNG's business content. Internal computation failures are logged as program errors, not disguised as invalid user input.
+
+## Core algorithm
+
+### 1. Image preparation and grid division
+
+The entry point decodes the image with Pillow and reads its dimensions and pixel count. It rejects images that exceed limits or fail to decode. It also applies EXIF orientation and converts ICC colors to sRGB; images without an ICC profile are interpreted as sRGB. After entry validation, image processing receives only normalized images and does not repeat format, size, or parameter checks.
+
+1. Convert sRGB to linear RGB. Composite transparent images over white in linear RGB so semitransparent edges do not darken.
+2. In default mode, center-crop to the target `width / height` ratio. With `preserve_aspect_ratio=true`, skip cropping and use the entire normalized image.
+3. Area-average into the final `width × height` grid. Each output cell is the mean linear RGB color of its corresponding source region.
+
+### 2. Nearest color code
+
+Convert grid averages and palette HEX colors to the same CIE Lab definition: sRGB primaries and a D65 white point. First decode palette HEX as sRGB to linear RGB. Grid averages are already linear RGB and must not be decoded again. For each cell, compute CIEDE2000 color difference against every color in the selected series and choose the smallest:
+
+`code(i, j) = argmin_color ΔE00(grid(i, j), color)`
+
+If differences tie, choose the first color by sorted code for deterministic output. Match only against the selected series. The resulting `height × width` code matrix is the sole data source for rendering the pattern.
+
+Matching accuracy depends on the palette HEX values; if they differ from the appearance of physical beads, the nearest code may look inaccurate. Default center-cropping loses edge content; `preserve_aspect_ratio=true` avoids cropping. Averaging removes details smaller than a cell. These are explicit tradeoffs of the current algorithm.
+
+### 3. PNG pattern
+
+Fill each cell with its matched color, and draw grid lines and row and column coordinates. Print a short marker in every cell, such as its number in sorted color-code order, choosing whichever of black or white text has higher contrast. Draw a color-code legend next to or below the pattern with each marker, swatch, full code, color name, and bead count. List only colors actually used. Counts must sum to `width × height`. Increase canvas height for larger legends, and limit cell size and maximum canvas dimensions to prevent unreadable text or oversized PNGs. Generate exactly one PNG image.
+
+## FastAPI endpoints
+
+| Endpoint | Function |
+| --- | --- |
+| `GET /api/registries` | List local registries |
+| `GET /api/registries/{registry_id}/series` | List a registry's series |
+| `POST /api/generate` | Receive an image and return the pattern PNG |
+
+`POST /api/generate` uses `multipart/form-data` with `image`, `registry_id`, `series_id`, `width`, and `height`, plus optional `preserve_aspect_ratio`. Default mode requires both dimensions; aspect-ratio mode allows only one. The response type is `image/png`. The endpoint enforces the above input limits and returns clear errors for invalid images, IDs, or dimensions. Callers obtain the pattern directly from the response; the production service has no download-by-ID endpoint.
+
+The current pattern limit is 200 cells per side and 40,000 cells in total, so `200 × 200` is valid.
+
+## Core pseudocode
+
+```python
+def generate(validated_image, palette, width, height, crop):
+    pixels = normalize_and_crop(validated_image, width, height, crop=crop)
+    grid_rgb = area_average_in_linear_rgb(pixels, width, height)
+    grid_lab = linear_rgb_to_lab_d65(grid_rgb)
+    codes = nearest_palette_codes(grid_lab, palette)  # CIEDE2000
+    counts = count_codes(codes)
+    return render_png(codes, counts, palette)
+```
+
+## Acceptance checks
+
+- Every cell of a single-color image maps to the same nearest code.
+- The result matrix is `height × width`, and legend bead counts sum to `width × height`.
+- Switching registries restricts matching to colors in the selected registry.
+- Edge pixels of images whose dimensions do not divide evenly contribute to average colors.
+- Transparent edges and ICC-profiled images have correct colors after normalization; a grid larger than the source image has no empty cells.
+- The PNG grid, cell markers, and legend all use the same color-code matrix.
+- The longest codes and largest legends remain readable; requests exceeding canvas limits are explicitly rejected.
+- Integration tests can use a mock upstream to upload an image and a mock downstream to receive the PNG returned by `/api/generate`.
+- The mock downstream receives PNG bytes identical to the API response, and the transport function clearly reports send failures.
+- Running from source finds the sibling `src/data/registries/` directory, and the production app does not import integration-test mocks.
